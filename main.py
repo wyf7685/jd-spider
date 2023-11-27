@@ -54,6 +54,7 @@ def run_sync(call: Callable[P, R]) -> Callable[P, Coroutine[None, None, R]]:
 
 
 def fix_cookies(cks: list[dict]) -> list[dict]:
+    """对Cookies进行修饰以确保其正确性"""
     cookies = []
     for ck in cks:
         cookies.append(
@@ -72,6 +73,11 @@ def fix_cookies(cks: list[dict]) -> list[dict]:
 
 
 async def load_cookies():
+    """
+    从文件加载Cookies
+
+    若文件不存在，则打开浏览器提示用户登录
+    """
     fp = Path("cookies.json")
     if fp.exists():
         cks = json.loads(fp.read_text())
@@ -90,6 +96,8 @@ async def load_cookies():
 def safe_run(
     call: Callable[P, Coroutine[None, None, R]], return_on_err: R
 ) -> Callable[P, Coroutine[None, None, R]]:
+    """包装一个异步函数，捕获其运行错误并输出"""
+
     @wraps(call)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
@@ -107,10 +115,13 @@ def safe_run(
 
 async def scroll(driver: Chrome, grab: Callable[[], R]) -> R:
     """通过向网页发送向下翻页指令，加载全部数据"""
+
+    # 向页面的body发送PAGE_DOWN指令
     send_page_down = run_sync(
         lambda: driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
     )
 
+    # 点击重试按钮，加载后30条数据
     @run_sync
     def click_btn():
         xpath = '//*[@id="J_scroll_loading"]/span/a'
@@ -123,10 +134,12 @@ async def scroll(driver: Chrome, grab: Callable[[], R]) -> R:
     for _ in range(12):
         await click_btn()
         await send_page_down()
+        # 每次翻页时爬取一次当前页面数据
         newdata = grab()
         if 0 in newdata:  # type: ignore
             return data
         data = newdata
+        # 随机等待0.5~1.5秒，规避反爬
         await asyncio.sleep(random.uniform(0.5, 1.5))
         await click_btn()
         # 触发反爬登录跳转
@@ -158,16 +171,22 @@ async def create_driver(headless: bool = True, load_cookies: bool = True):
         "excludeSwitches", ["enable-automation"]
     )  # 反爬的某个选项(?)
     svc = Service(executable_path="./chromedriver.exe")
+
+    # 创建WebDriver
     driver = await run_sync(Chrome)(options=options, service=svc)
+    # 执行CDP命令，将webdriver标记设为undefined
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
     )
+    # 执行CDP命令，加载js模块stealth，反反爬
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": js_stealth},
     )
+    # 最大化窗口
     driver.maximize_window()
+    # 打开京东首页并写入Cookies
     await run_sync(driver.get)("https://jd.com/")
     if load_cookies and COOKIES:
         logger.info("向浏览器添加cookies")
@@ -178,15 +197,20 @@ async def create_driver(headless: bool = True, load_cookies: bool = True):
 
 
 async def jd_spider(page: int):
+    # 使用loguru模块的日志记录器格式化输出
     logger = get_logger(f"Spider-{page+1}").opt(colors=True)
     logger.info(f"开始爬取页面: <g>{page+1}</g>")
     url = f"https://search.jd.com/Search?keyword={ITEM_NAME}&page={page*2+1}"
     logger.info(f"页面URL: <c>{url}</c>")
-    driver = await create_driver(False)
+    # 创建WebDriver
+    # 将参数中headless改为True即可隐藏浏览器窗口
+    driver = await create_driver(headless=False)
+    # 打开目标网页
     await run_sync(driver.get)(url)
 
     def grab():
         tree = etree.HTML(driver.page_source, None)
+        # 通过XPath定位HTML元素，解析商品数据
         names = tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[3]/a/em')
         prices = tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[2]/strong/i/text()')
         hrefs = [
@@ -199,6 +223,7 @@ async def jd_spider(page: int):
             f"https:{i}"
             for i in tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[1]/a/img/@src')
         ]
+        # 对于商品名，使用BeautifulSoup模块进一步解析，提取纯文本
         names = [
             BeautifulSoup(etree.tostring(name).decode("utf-8"), "lxml")
             .get_text(strip=True)
@@ -209,24 +234,30 @@ async def jd_spider(page: int):
         ]
         data = (names, prices, hrefs, comments, shops, img_urls)
         info = tuple(map(len, data))
+        # 输出本次解析获取到的数据量
         logger.info(f"爬取数据: <c>{info}</c>")
         return data
 
     result = await scroll(driver, grab)
+    driver.close()
+    # 检查是否触发反爬登录跳转，加入Cookies后不会触发
     if "passport.jd" in driver.current_url and min(map(len, result)) < 20:
-        driver.close()
         logger.warning("触发反爬跳转，重新开始爬取")
         return await jd_spider(page)
+    # 检查是否触发人机验证
     if "cfe.m.jd" in driver.current_url:
         logger.warning("触发反爬验证码，请在弹出窗口通过验证后输入回车")
-        driver_cfe = await create_driver(True)
+        # 打开一个新的窗口，提示用户进行人机验证
+        driver_cfe = await create_driver(False)
         driver_cfe.get(driver.current_url)
         driver_cfe.execute_script(f'alert("触发反爬验证码，请在在浏览器中通过验证后，回到控制台输入回车");')
         input()
         driver_cfe.close()
+        # 验证完成后重启当前爬取流程
         logger.warning("重新爬取当前页面...")
         return await jd_spider(page)
 
+    # 将爬取到的数据格式化为字典数组
     names, prices, hrefs, comments, shops, img_urls = result
     newdata = [
         {
@@ -242,22 +273,27 @@ async def jd_spider(page: int):
         )
     ]
     logger.info(f"保存 <y>{len(newdata)}</y> 条数据到本地")
+    # 将数据追加到本地JSON文件
     data = json.loads(FILE.read_text("utf-8"))  # type: list
     data.extend(newdata)
     FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
+    # 下载页面中爬取到的图片链接
     logger.info(f"开始下载图片: len=<y>{len(img_urls)}</y>")
+    # 使用异步HTTP库 aiohttp 的 ClientSession 创建会话
+    # 会话使用随机User-Agent和与浏览器相同的Cookies
     async with ClientSession(
         headers={"User-Agent": get_user_agent_of_pc()},
-        cookies={i["name"]: i["value"] for i in driver.get_cookies()},
+        cookies={i["name"]: i["value"] for i in COOKIES},
     ) as session:
-
+        # 定义函数用于保存单张图片
         async def get_img(url: str, name: str):
             key = 0
             while True:
                 filename = md5((name + str(key)).encode("utf-8")).hexdigest()
                 fp = IMAGES / (filename + "." + url.split(".")[-1])
                 if not fp.exists():
+                    fp.write_bytes(b"")
                     break
                 key += 1
             fp.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +307,7 @@ async def jd_spider(page: int):
                 print("保存图片失败:", e)
                 print("图片路径:", fp)
 
+        # 每次创建5个协程，交由asyncio.gather()并发下载图片
         step = 5
         for i in range(len(img_urls) // 5):
             coros = [
@@ -278,23 +315,29 @@ async def jd_spider(page: int):
                 for idx, url in enumerate(img_urls[i * step : (i + 1) * step])
             ]
             await asyncio.gather(*coros)
+
+    # 输出提示结束当前页面爬取
     logger.info(f"页面 <g>{page+1}</g> 爬取完成")
 
 
 async def main():
     logger = get_logger("Main").opt(colors=True)
     logger.info("正在初始化京东爬虫...")
+    # 初始化Cookies
     await load_cookies()
 
+    # 使用safe_run包装函数
     spider_func = safe_run(jd_spider, None)
-    total = 1000
-    step = 6
-    start = datetime.now()
+    total = 150  # 爬取共计150页数据
+    step = 6  # 每次创建6个协程，并发爬取商品数据
+    start = datetime.now()  # 记录开始时间
     logger.info(f"开始爬取京东商品: <g>{ITEM_NAME}</g>")
     logger.info(f"单次爬取页面数: <g>{step}</g>")
     for i in range(total // step):
         coros = [spider_func(page) for page in range(i * step, (i + 1) * step)]
+        # 使用asyncio.gather()并发处理step个页面
         await asyncio.gather(*coros)
+
     # 计算耗时
     seconds = round((datetime.now() - start).total_seconds())
     minutes = seconds // 60
