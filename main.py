@@ -239,7 +239,6 @@ async def jd_spider(page: int):
         return data
 
     result = await scroll(driver, grab)
-    driver.close()
     # 检查是否触发反爬登录跳转，加入Cookies后不会触发
     if "passport.jd" in driver.current_url and min(map(len, result)) < 20:
         logger.warning("触发反爬跳转，重新开始爬取")
@@ -256,6 +255,7 @@ async def jd_spider(page: int):
         # 验证完成后重启当前爬取流程
         logger.warning("重新爬取当前页面...")
         return await jd_spider(page)
+    driver.close()
 
     # 将爬取到的数据格式化为字典数组
     names, prices, hrefs, comments, shops, img_urls = result
