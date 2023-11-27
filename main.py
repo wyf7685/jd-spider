@@ -253,8 +253,13 @@ async def jd_spider(page: int):
     ) as session:
 
         async def get_img(url: str, name: str):
-            filename = md5(name.encode("utf-8")).hexdigest()
-            fp = IMAGES / (filename + "." + url.split(".")[-1])
+            key = 0
+            while True:
+                filename = md5((name + str(key)).encode("utf-8")).hexdigest()
+                fp = IMAGES / (filename + "." + url.split(".")[-1])
+                if not fp.exists():
+                    break
+                key += 1
             fp.parent.mkdir(parents=True, exist_ok=True)
             try:
                 async with session.get(url) as resp:
@@ -282,9 +287,8 @@ async def main():
     await load_cookies()
 
     spider_func = safe_run(jd_spider, None)
-    # coros = [spider_func(i) for i in range(1000)]
     total = 1000
-    step = 5
+    step = 6
     start = datetime.now()
     logger.info(f"开始爬取京东商品: <g>{ITEM_NAME}</g>")
     logger.info(f"单次爬取页面数: <g>{step}</g>")
