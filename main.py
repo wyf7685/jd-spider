@@ -279,14 +279,16 @@ async def jd_spider(page: int) -> None:
         return await jd_spider(page)
     # 检查是否触发人机验证
     if "cfe.m.jd" in driver.current_url:
+        url = driver.current_url
         driver.close()
         logger.warning("触发反爬验证码，请在弹出窗口通过验证")
         # 打开一个新的窗口，提示用户进行人机验证
         driver_cfe = await create_driver(False)
-        driver_cfe.get(driver.current_url)
-        with suppress(Exception):
-            driver_cfe.execute_script(f'alert("触发反爬验证码，请在在浏览器中通过验证");')
-        while "cfe.m.jd" in driver.current_url:
+        driver_cfe.get(url)
+        # with suppress(Exception):
+        #     driver_cfe.execute_script(f'alert("触发反爬验证码，请在在浏览器中通过验证");')
+        time.sleep(5)
+        while "cfe.m.jd" in driver_cfe.current_url:
             # 使用time.sleep()而非asyncio.sleep()，阻塞线程直到通过验证
             time.sleep(0.5)
         driver_cfe.close()
@@ -327,7 +329,9 @@ async def jd_spider(page: int) -> None:
     ) as session:
         # 定义函数用于保存单张图片
         async def get_img(url: str, name: str):
-            fp = IMAGES_DIR / (fix_name(name) + "." + url.split(".")[-1])
+            name += f"-{random.randint(10,99)}."
+            name += url.split(".")[-1]
+            fp = IMAGES_DIR / fix_name(name)
             fp.parent.mkdir(parents=True, exist_ok=True)
             try:
                 async with session.get(url) as resp:
