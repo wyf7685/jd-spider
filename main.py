@@ -1,17 +1,21 @@
 import asyncio
 import json
+import os
 import random
-from datetime import datetime
+import time
+from contextlib import suppress
 from contextvars import copy_context
+from datetime import datetime
 from functools import partial, wraps
-from hashlib import md5
 from pathlib import Path
-from typing import Callable, Coroutine, ParamSpec, TypeVar
+from typing import Any, Callable, Coroutine, Dict, List, ParamSpec, TypeVar
 from urllib.parse import quote_plus
 
+import pillow_avif as _
 from aiohttp import ClientError, ClientSession
 from bs4 import BeautifulSoup
 from lxml import etree
+from PIL import Image, ImageOps
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -21,20 +25,22 @@ from src.log import get_logger
 from src.stealth import js_stealth
 from src.user_agent import get_user_agent_of_pc
 
-
-# 待爬取的商品名
-ITEM_NAME = quote_plus("RTX4060Ti")
-DATA = Path("data")
-IMAGES = DATA / "images"
-IMAGES.mkdir(parents=True, exist_ok=True)
-FILE = DATA / f"{ITEM_NAME}.json"
-if not FILE.exists():
-    FILE.write_text("[]")
+# 定义常量
+ITEM_NAME = "明日方舟"  # 待爬取的商品名
+QUOTE_NAME = quote_plus(ITEM_NAME)  # 用于URL拼接的商品名
+DATA_DIR = Path("data")  # 数据目录
+IMAGES_DIR = DATA_DIR / "images" / ITEM_NAME  # 图片保存路径
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)  # 确保文件夹存在
+DATA_FILE = DATA_DIR / f"{ITEM_NAME}.json"  # 数据文件路径
+COOKIES_FILE = DATA_DIR / "cookies.json"  # Cookies文件路径
+if not DATA_FILE.exists():
+    DATA_FILE.write_text("[]")
 
 COOKIES = []
 USER_AGENT = get_user_agent_of_pc()
 
 
+# 泛型模板变量
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -53,7 +59,7 @@ def run_sync(call: Callable[P, R]) -> Callable[P, Coroutine[None, None, R]]:
     return _wrapper
 
 
-def fix_cookies(cks: list[dict]) -> list[dict]:
+def fix_cookies(cks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """对Cookies进行修饰以确保其正确性"""
     cookies = []
     for ck in cks:
@@ -72,13 +78,13 @@ def fix_cookies(cks: list[dict]) -> list[dict]:
     return cookies
 
 
-async def load_cookies():
+async def load_cookies() -> None:
     """
     从文件加载Cookies
 
     若文件不存在，则打开浏览器提示用户登录
     """
-    fp = Path("cookies.json")
+    fp = COOKIES_FILE
     if fp.exists():
         cks = json.loads(fp.read_text())
     else:
@@ -86,31 +92,47 @@ async def load_cookies():
         await run_sync(driver.get)(
             "https://passport.jd.com/new/login.aspx?ReturnUrl=https%3A%2F%2Fwww.jd.com%2F"
         )
-        input()
+        while "passport.jd.com" in driver.current_url or "qq.com" in driver.current_url:
+            await asyncio.sleep(0.5)
         cks = driver.get_cookies()
 
     COOKIES[:] = fix_cookies(cks)
     fp.write_text(json.dumps(COOKIES))
 
 
+def fix_name(name: str):
+    for key in '$/:?*"<>\\|':
+        name = name.replace(key, "")
+    return name.strip()
+
+
 def safe_run(
-    call: Callable[P, Coroutine[None, None, R]], return_on_err: R
-) -> Callable[P, Coroutine[None, None, R]]:
+    call: Callable[P, Coroutine[None, None, Any]]
+) -> Callable[P, Coroutine[None, None, None]]:
     """包装一个异步函数，捕获其运行错误并输出"""
 
     @wraps(call)
-    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
         try:
-            return await call(*args, **kwargs)
+            await call(*args, **kwargs)
         except Exception as e:
             logger = get_logger("SafeRun").opt(colors=True, exception=e)
             logger.error(f"运行函数 {call.__name__} 时发生错误")
             logger.error(f"    args: {args}, kwargs: {kwargs}")
             err_msg = f"    {e.__class__.__name__}: {e}"
             logger.error(err_msg.replace("<", "\\<"))
-            return return_on_err
+            return
 
     return wrapper
+
+
+@safe_run
+@run_sync
+def solve_image(fp: Path):
+    im = Image.open(fp)
+    pngfp = fp.parent / f"{fp.name}.png"
+    ImageOps.exif_transpose(im).save(pngfp, "PNG")
+    os.remove(fp)
 
 
 async def scroll(driver: Chrome, grab: Callable[[], R]) -> R:
@@ -149,7 +171,7 @@ async def scroll(driver: Chrome, grab: Callable[[], R]) -> R:
     return data
 
 
-async def create_driver(headless: bool = True, load_cookies: bool = True):
+async def create_driver(headless: bool = True, load_cookies: bool = True) -> Chrome:
     """创建driver"""
     logger = get_logger("Driver")
     options = ChromeOptions()
@@ -196,24 +218,13 @@ async def create_driver(headless: bool = True, load_cookies: bool = True):
     return driver
 
 
-async def jd_spider(page: int):
-    # 使用loguru模块的日志记录器格式化输出
-    logger = get_logger(f"Spider-{page+1}").opt(colors=True)
-    logger.info(f"开始爬取页面: <g>{page+1}</g>")
-    url = f"https://search.jd.com/Search?keyword={ITEM_NAME}&page={page*2+1}"
-    logger.info(f"页面URL: <c>{url}</c>")
-    # 创建WebDriver
-    # 将参数中headless改为True即可隐藏浏览器窗口
-    driver = await create_driver(headless=False)
-    # 打开目标网页
-    await run_sync(driver.get)(url)
-
+def grab_func(html: Callable[[], str], log: Callable[[str], None]):
     def grab():
-        tree = etree.HTML(driver.page_source, None)
+        tree = etree.HTML(html(), None)
         # 通过XPath定位HTML元素，解析商品数据
         names = tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[3]/a/em')
         prices = tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[2]/strong/i/text()')
-        hrefs = [
+        urls = [
             f"https:{i}"
             for i in tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[1]/a/@href')
         ]
@@ -223,34 +234,61 @@ async def jd_spider(page: int):
             f"https:{i}"
             for i in tree.xpath('//*[@id="J_goodsList"]/ul/li/div/div[1]/a/img/@src')
         ]
-        # 对于商品名，使用BeautifulSoup模块进一步解析，提取纯文本
+        # 对于商品名，使用BeautifulSoup进一步解析，提取纯文本
         names = [
-            BeautifulSoup(etree.tostring(name).decode("utf-8"), "lxml")
-            .get_text(strip=True)
-            .replace("\n", " ")
-            .replace("\t", " ")
-            .strip()
+            fix_name(
+                BeautifulSoup(etree.tostring(name).decode("utf-8"), "lxml").get_text(
+                    strip=True
+                )
+            )
             for name in names
         ]
-        data = (names, prices, hrefs, comments, shops, img_urls)
+
+        data = (names, prices, urls, comments, shops, img_urls)
         info = tuple(map(len, data))
         # 输出本次解析获取到的数据量
-        logger.info(f"爬取数据: <c>{info}</c>")
+        log(f"爬取数据: <c>{info}</c>")
         return data
 
+    return grab
+
+
+@safe_run
+async def jd_spider(page: int) -> None:
+    # 使用loguru模块的日志记录器格式化输出
+    logger = get_logger(f"Spider-{page+1}").opt(colors=True)
+    logger.info(f"开始爬取页面: <g>{page+1}</g>")
+    url = f"https://search.jd.com/Search?keyword={QUOTE_NAME}&page={page*2+1}"
+    logger.info(f"页面URL: <c>{url}</c>")
+    # 创建WebDriver
+    # 参数中headless指定是否隐藏浏览器窗口
+    # 隐藏窗口爬取时，容易出现每页只有30条
+    # 当希望爬取尽可能多的数据时，应当选择显示窗口
+    driver = await create_driver(headless=False)
+    # 打开目标网页
+    await run_sync(driver.get)(url)
+
+    # 翻页并爬取数据
+    grab = grab_func(lambda: driver.page_source, logger.info)
     result = await scroll(driver, grab)
+
     # 检查是否触发反爬登录跳转，加入Cookies后不会触发
     if "passport.jd" in driver.current_url and min(map(len, result)) < 20:
+        driver.close()
         logger.warning("触发反爬跳转，重新开始爬取")
         return await jd_spider(page)
     # 检查是否触发人机验证
     if "cfe.m.jd" in driver.current_url:
-        logger.warning("触发反爬验证码，请在弹出窗口通过验证后输入回车")
+        driver.close()
+        logger.warning("触发反爬验证码，请在弹出窗口通过验证")
         # 打开一个新的窗口，提示用户进行人机验证
         driver_cfe = await create_driver(False)
         driver_cfe.get(driver.current_url)
-        driver_cfe.execute_script(f'alert("触发反爬验证码，请在在浏览器中通过验证后，回到控制台输入回车");')
-        input()
+        with suppress(Exception):
+            driver_cfe.execute_script(f'alert("触发反爬验证码，请在在浏览器中通过验证");')
+        while "cfe.m.jd" in driver.current_url:
+            # 使用time.sleep()而非asyncio.sleep()，阻塞线程直到通过验证
+            time.sleep(0.5)
         driver_cfe.close()
         # 验证完成后重启当前爬取流程
         logger.warning("重新爬取当前页面...")
@@ -258,28 +296,29 @@ async def jd_spider(page: int):
     driver.close()
 
     # 将爬取到的数据格式化为字典数组
-    names, prices, hrefs, comments, shops, img_urls = result
+    names, prices, urls, comments, shops, img_urls = result
     newdata = [
         {
             "name": name,
             "price": price,
-            "href": href,
+            "url": url,
             "comment": comment,
             "shop": shop,
             "img_url": img_url,
         }
-        for name, price, href, comment, shop, img_url in zip(
-            names, prices, hrefs, comments, shops, img_urls
+        for name, price, url, comment, shop, img_url in zip(
+            names, prices, urls, comments, shops, img_urls
         )
     ]
     logger.info(f"保存 <y>{len(newdata)}</y> 条数据到本地")
     # 将数据追加到本地JSON文件
-    data = json.loads(FILE.read_text("utf-8"))  # type: list
+    data = json.loads(DATA_FILE.read_text("utf-8"))  # type: List[Dict[str, Any]]
     data.extend(newdata)
-    FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
     # 下载页面中爬取到的图片链接
     logger.info(f"开始下载图片: len=<y>{len(img_urls)}</y>")
+    fps = []  # type: List[Path]
     # 使用异步HTTP库 aiohttp 的 ClientSession 创建会话
     # 会话使用随机User-Agent和与浏览器相同的Cookies
     async with ClientSession(
@@ -288,14 +327,7 @@ async def jd_spider(page: int):
     ) as session:
         # 定义函数用于保存单张图片
         async def get_img(url: str, name: str):
-            key = 0
-            while True:
-                filename = md5((name + str(key)).encode("utf-8")).hexdigest()
-                fp = IMAGES / (filename + "." + url.split(".")[-1])
-                if not fp.exists():
-                    fp.write_bytes(b"")
-                    break
-                key += 1
+            fp = IMAGES_DIR / (fix_name(name) + "." + url.split(".")[-1])
             fp.parent.mkdir(parents=True, exist_ok=True)
             try:
                 async with session.get(url) as resp:
@@ -306,15 +338,22 @@ async def jd_spider(page: int):
             except Exception as e:
                 print("保存图片失败:", e)
                 print("图片路径:", fp)
+            else:
+                fps.append(fp)
 
         # 每次创建5个协程，交由asyncio.gather()并发下载图片
         step = 5
-        for i in range(len(img_urls) // 5):
+        for i in range(len(img_urls) // step):
             coros = [
-                get_img(url, shops[idx] + names[idx])
-                for idx, url in enumerate(img_urls[i * step : (i + 1) * step])
+                get_img(img_urls[idx], shops[idx] + " " + names[idx])
+                for idx in range(i * step, (i + 1) * step)
             ]
             await asyncio.gather(*coros)
+
+    # 将图片格式统一转换为PNG
+    logger.info("图片下载完成，转换图片格式为 <g>PNG</g>")
+    call = safe_run(solve_image)
+    await asyncio.gather(*[call(fp) for fp in fps])
 
     # 输出提示结束当前页面爬取
     logger.info(f"页面 <g>{page+1}</g> 爬取完成")
@@ -327,14 +366,13 @@ async def main():
     await load_cookies()
 
     # 使用safe_run包装函数
-    spider_func = safe_run(jd_spider, None)
     total = 150  # 爬取共计150页数据
-    step = 6  # 每次创建6个协程，并发爬取商品数据
+    step = 6  # 每次创建step个协程，并发爬取商品数据
     start = datetime.now()  # 记录开始时间
     logger.info(f"开始爬取京东商品: <g>{ITEM_NAME}</g>")
     logger.info(f"单次爬取页面数: <g>{step}</g>")
     for i in range(total // step):
-        coros = [spider_func(page) for page in range(i * step, (i + 1) * step)]
+        coros = [jd_spider(page) for page in range(i * step, (i + 1) * step)]
         # 使用asyncio.gather()并发处理step个页面
         await asyncio.gather(*coros)
 
