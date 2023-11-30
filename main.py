@@ -1,9 +1,9 @@
 import asyncio
+import contextlib
 import json
 import os
 import random
 import time
-from contextlib import suppress
 from contextvars import copy_context
 from datetime import datetime
 from functools import partial, wraps
@@ -61,21 +61,19 @@ def run_sync(call: Callable[P, R]) -> Callable[P, Coroutine[None, None, R]]:
 
 def fix_cookies(cks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """对Cookies进行修饰以确保其正确性"""
-    cookies = []
-    for ck in cks:
-        cookies.append(
-            {
-                "domain": ".jd.com",
-                "name": ck.get("name"),
-                "value": ck.get("value"),
-                "expires": "",
-                "path": "/",
-                "httpOnly": False,
-                "HostOnly": False,
-                "Secure": False,
-            }
-        )
-    return cookies
+    return [
+        {
+            "domain": ".jd.com",
+            "name": ck.get("name"),
+            "value": ck.get("value"),
+            "expires": "",
+            "path": "/",
+            "httpOnly": False,
+            "HostOnly": False,
+            "Secure": False,
+        }
+        for ck in cks
+    ]
 
 
 async def load_cookies() -> None:
@@ -147,10 +145,8 @@ async def scroll(driver: Chrome, grab: Callable[[], R]) -> R:
     @run_sync
     def click_btn():
         xpath = '//*[@id="J_scroll_loading"]/span/a'
-        try:
+        with contextlib.suppress(Exception):
             driver.find_element(By.XPATH, xpath).click()
-        except:
-            pass
 
     data = grab()
     for _ in range(12):
@@ -166,7 +162,10 @@ async def scroll(driver: Chrome, grab: Callable[[], R]) -> R:
         await click_btn()
         # 触发反爬登录跳转
         # 增加Cookie后不会触发
-        if "passport.jd" in driver.current_url or "cfe.m.jd" in driver.current_url:
+        if "passport.jd" in driver.current_url:
+            break
+        # 触发人机验证
+        if "cfe.m.jd" in driver.current_url:
             break
     return data
 
@@ -175,7 +174,7 @@ async def create_driver(headless: bool = True, load_cookies: bool = True) -> Chr
     """创建driver"""
     logger = get_logger("Driver")
     options = ChromeOptions()
-    options.add_argument("user-agent=" + USER_AGENT)  # 指定UserAgent
+    options.add_argument(f"user-agent={USER_AGENT}")
     if headless:
         logger.info("以无头模式创建driver")
         options.add_argument("--headless")  # 禁用窗口
@@ -324,9 +323,9 @@ async def jd_spider(page: int) -> None:
     # 使用异步HTTP库 aiohttp 的 ClientSession 创建会话
     # 会话使用随机User-Agent和与浏览器相同的Cookies
     async with ClientSession(
-        headers={"User-Agent": get_user_agent_of_pc()},
-        cookies={i["name"]: i["value"] for i in COOKIES},
-    ) as session:
+            headers={"User-Agent": get_user_agent_of_pc()},
+            cookies={i["name"]: i["value"] for i in COOKIES},
+        ) as session:
         # 定义函数用于保存单张图片
         async def get_img(url: str, name: str):
             name += f"-{random.randint(10,99)}."
@@ -337,11 +336,11 @@ async def jd_spider(page: int) -> None:
                 async with session.get(url) as resp:
                     fp.write_bytes(await resp.read())
             except ClientError as e:
-                print("下载图片失败:", e)
-                print("图片URL:", url)
+                logger.warning("下载图片失败:", e)
+                logger.warning("图片URL:", url)
             except Exception as e:
-                print("保存图片失败:", e)
-                print("图片路径:", fp)
+                logger.warning("保存图片失败:", e)
+                logger.warning("图片路径:", fp)
             else:
                 fps.append(fp)
 
@@ -349,7 +348,7 @@ async def jd_spider(page: int) -> None:
         step = 5
         for i in range(len(img_urls) // step):
             coros = [
-                get_img(img_urls[idx], shops[idx] + " " + names[idx])
+                get_img(img_urls[idx], f"{shops[idx]} {names[idx]}")
                 for idx in range(i * step, (i + 1) * step)
             ]
             await asyncio.gather(*coros)
