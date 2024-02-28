@@ -32,6 +32,7 @@ poetry run main.py
   5. ~~代码主要用于提交导论作业，结构混乱还请见谅~~
 
 ## Contributors | 贡献者
-  - [wyf7685 ~~我自己~~](https://github.com/wyf7685)
+
+![Contributors](https://contrib.rocks/image?repo=wyf7685/jd-spider)
 
 ~~<u>[原地TP](http://github.com/wyf7685/jd-spider)</u>~~
